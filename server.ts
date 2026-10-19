@@ -586,74 +586,6 @@ async function removePinAsset(
     console.warn("Could not delete Cloudinary asset:", err);
   }
 }
-// note here
-async function getCloudinaryPins() {
-  const response = await cloudinary.api.resources_by_asset_folder(
-    "pinspire_pins",
-    {
-      resource_type: "image",
-      type: "upload",
-      max_results: 500,
-      context: true,
-    },
-  );
-  // Note this Point
-  return response.resources.map((resource: any) => {
-    let metadata: Record<string, any> = {};
-    const encodedMetadata = resource.context?.custom?.zion;
-    if (encodedMetadata) {
-      try {
-        metadata = JSON.parse(
-          Buffer.from(encodedMetadata, "base64url").toString("utf8"),
-        );
-      } catch {
-        metadata = {};
-      }
-    }
-
-    const title =
-      metadata.title ||
-      resource.original_filename ||
-      "Learning in Caro Favour School";
-    const ratio =
-      resource.width && resource.height ? resource.width / resource.height : 1;
-
-    return {
-      id: `cloudinary-${Buffer.from(resource.public_id).toString("base64url")}`,
-      title,
-      description:
-        metadata.description ||
-        "Image that captures the essence of Caro Favour School's rich history and vibrant environment.",
-      imageUrl: resource.secure_url,
-      cloudinaryPublicId: resource.public_id,
-      aspectRatio:
-        metadata.aspectRatio ||
-        (ratio > 1.3 ? "16/9" : ratio > 0.85 ? "1/1" : "2/3"),
-      category: metadata.category || "Unclassified",
-      tags:
-        metadata.tags ||
-        (resource.tags?.length ? resource.tags : ["cloudinary", "recovered"]),
-      dominantColor: metadata.dominantColor || {
-        name: "Stone",
-        hex: "#78716C",
-      },
-      author: {
-        name: "Caro Favour School Library",
-        handle: "@Caro Favour School",
-        avatar:
-          "https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=140&q=80",
-        role: "admin",
-      },
-      curatedByAdmin: true,
-      savedCount: 0,
-      likesCount: 0,
-      likedByUser: false,
-      createdAt: resource.created_at,
-      comments: [],
-    };
-  });
-}
-
 // Auth Middleware: Verify Admin JWT Token
 const verifyAdmin = (req: Request, res: Response, next: NextFunction) => {
   const authHeader = req.headers.authorization;
@@ -778,6 +710,13 @@ app.get("/api/auth/me", (req: Request, res: Response) => {
 // Endpoint: Upload image to Cloudinary (Protected: Admin Only)
 app.post("/api/upload", verifyAdmin, async (req: Request, res: Response) => {
   try {
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        error:
+          "The image library database is unavailable. Nothing was uploaded.",
+      });
+    }
+
     const {
       imageBase64,
       title,
@@ -839,41 +778,33 @@ app.get("/api/health", (_req: Request, res: Response) => {
 
 // Endpoint: Get all pins from MongoDB
 app.get("/api/pins", async (_req: Request, res: Response) => {
-  let mongoPins: any[] = [];
-  let mongoReadFailed = mongoose.connection.readyState !== 1;
-  try {
-    if (!mongoReadFailed) {
-      mongoPins = await PinModel.find().sort({ createdAt: -1 }).lean();
-    }
-  } catch (err: any) {
-    console.error("Error fetching pins from MongoDB:", err);
-    mongoReadFailed = true;
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({
+      error: "The image library database is unavailable.",
+    });
   }
 
   try {
-    const cloudinaryPins = await getCloudinaryPins();
-    const storedPublicIds = new Set(
-      mongoPins.map((pin) => pin.cloudinaryPublicId).filter(Boolean),
-    );
-    const recoveredPins = cloudinaryPins.filter(
-      (pin: any) => !storedPublicIds.has(pin.cloudinaryPublicId),
-    );
-
-    return res.json([...mongoPins, ...recoveredPins]);
-  } catch (err: any) {
-    console.error("Error fetching pins from Cloudinary:", err?.message || err);
-    if (mongoReadFailed) {
-      return res.status(503).json({
-        error: "Image library storage is temporarily unavailable.",
-      });
-    }
+    const mongoPins = await PinModel.find().sort({ createdAt: -1 }).lean();
     return res.json(mongoPins);
+  } catch (err: any) {
+    console.error("Error fetching pins from MongoDB:", err);
+    return res.status(503).json({
+      error: "Could not load the image library from the database.",
+    });
   }
 });
 
 // Endpoint: Create a new Pin in MongoDB (Protected: Admin Only)
 app.post("/api/pins", verifyAdmin, async (req: Request, res: Response) => {
   const pinData = req.body;
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({
+      error:
+        "The image library database is unavailable. The image was not published.",
+    });
+  }
+
   try {
     const pinId = pinData.id || `pin-${Date.now()}`;
 
@@ -891,25 +822,13 @@ app.post("/api/pins", verifyAdmin, async (req: Request, res: Response) => {
       createdAt: new Date(),
     });
 
-    if (mongoose.connection.readyState !== 1) {
-      console.warn(
-        `MongoDB unavailable; keeping pin in Cloudinary: "${newPin.title}" (${pinId})`,
-      );
-      return res.status(201).json(newPin);
-    }
-
     await newPin.save();
     console.log(`Pin saved to MongoDB: "${newPin.title}" (${pinId})`);
 
     return res.status(201).json(newPin);
   } catch (err: any) {
     console.error("Error saving pin to MongoDB:", err);
-    if (pinData.imageUrl && pinData.cloudinaryPublicId) {
-      console.warn(
-        "Pin remains available from Cloudinary after the MongoDB error.",
-      );
-      return res.status(201).json(pinData);
-    }
+    await removePinAsset(pinData);
     return res.status(500).json({
       error: "Failed to save pin to database",
       details: err?.message || String(err),
